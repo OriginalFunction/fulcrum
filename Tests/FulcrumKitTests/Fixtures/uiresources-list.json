@@ -1,0 +1,29 @@
+{
+  "kind": "UIResourceList",
+  "apiVersion": "tilt.dev/v1alpha1",
+  "metadata": { "resourceVersion": "57" },
+  "items": [
+    {
+      "metadata": { "name": "(Tiltfile)", "resourceVersion": "12" },
+      "status": { "updateStatus": "ok", "runtimeStatus": "not_applicable", "order": 1 }
+    },
+    {
+      "metadata": { "name": "hello", "resourceVersion": "31" },
+      "status": {
+        "updateStatus": "ok",
+        "runtimeStatus": "not_applicable",
+        "order": 2,
+        "buildHistory": [{ "startTime": "2026-08-04T09:09:11Z", "finishTime": "2026-08-04T09:09:15Z" }]
+      }
+    },
+    {
+      "metadata": { "name": "slow", "resourceVersion": "44" },
+      "status": {
+        "updateStatus": "not_applicable",
+        "runtimeStatus": "ok",
+        "order": 3,
+        "disableStatus": { "state": "Enabled" }
+      }
+    }
+  ]
+}

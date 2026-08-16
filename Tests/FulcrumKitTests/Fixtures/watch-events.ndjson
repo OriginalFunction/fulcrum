@@ -1,0 +1,5 @@
+{"type":"ADDED","object":{"metadata":{"name":"(Tiltfile)","resourceVersion":"12"},"status":{"updateStatus":"ok","runtimeStatus":"not_applicable","order":1}}}
+{"type":"ADDED","object":{"metadata":{"name":"hello","resourceVersion":"31"},"status":{"updateStatus":"ok","runtimeStatus":"not_applicable","order":2}}}
+{"type":"MODIFIED","object":{"metadata":{"name":"hello","resourceVersion":"58"},"status":{"updateStatus":"in_progress","runtimeStatus":"not_applicable","order":2}}}
+{"type":"MODIFIED","object":{"metadata":{"name":"hello","resourceVersion":"61"},"status":{"updateStatus":"error","runtimeStatus":"not_applicable","order":2}}}
+{"type":"DELETED","object":{"metadata":{"name":"slow","resourceVersion":"70"},"status":{"updateStatus":"not_applicable","runtimeStatus":"ok","order":3}}}

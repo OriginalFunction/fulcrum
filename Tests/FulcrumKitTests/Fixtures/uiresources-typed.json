@@ -1,0 +1,45 @@
+{
+  "kind": "UIResourceList",
+  "apiVersion": "tilt.dev/v1alpha1",
+  "metadata": { "resourceVersion": "120" },
+  "items": [
+    {
+      "metadata": { "name": "(Tiltfile)", "resourceVersion": "12" },
+      "status": {
+        "updateStatus": "ok", "runtimeStatus": "not_applicable", "order": 1,
+        "buildHistory": [
+          { "startTime": "2026-08-05T15:02:35.602230Z", "finishTime": "2026-08-05T15:02:35.614231Z" }
+        ]
+      }
+    },
+    {
+      "metadata": { "name": "slow-build", "resourceVersion": "31" },
+      "status": {
+        "updateStatus": "ok", "runtimeStatus": "not_applicable", "order": 2,
+        "specs": [{ "id": "local:slow-build", "type": "local" }],
+        "buildHistory": [
+          { "startTime": "2026-08-05T15:02:36.867858Z", "finishTime": "2026-08-05T15:02:40.134921Z" }
+        ]
+      }
+    },
+    {
+      "metadata": { "name": "broken", "resourceVersion": "44" },
+      "status": {
+        "updateStatus": "error", "runtimeStatus": "not_applicable", "order": 3,
+        "specs": [{ "id": "local:broken", "type": "local" }],
+        "buildHistory": [
+          {
+            "startTime": "2026-08-05T15:02:40.137397Z",
+            "finishTime": "2026-08-05T15:02:40.168097Z",
+            "error": "Command \"exit 1\" failed: exit status 1"
+          }
+        ]
+      }
+    },
+    {
+      "metadata": { "name": "never-built", "resourceVersion": "50" },
+      "status": { "updateStatus": "pending", "runtimeStatus": "unknown", "order": 4,
+                  "specs": [{ "id": "k8s:never-built", "type": "k8s" }] }
+    }
+  ]
+}

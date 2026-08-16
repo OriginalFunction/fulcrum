@@ -1,0 +1,28 @@
+apiVersion: v1
+clusters:
+- cluster:
+    certificate-authority-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUJrVENDQVRlZ0F3SUJBZ0lRCi0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
+    server: https://127.0.0.1:55501
+  name: tilt-10360
+- cluster:
+    certificate-authority-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUJrVENDQVRlZ0F3SUJBZ0lRCi0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
+    server: https://127.0.0.1:55777
+  name: tilt-10350
+contexts:
+- context:
+    cluster: tilt-10360
+    user: tilt-10360
+  name: tilt-10360
+- context:
+    cluster: tilt-10350
+    user: tilt-10350
+  name: tilt-10350
+current-context: ""
+kind: Config
+users:
+- name: tilt-10360
+  user:
+    token: pH5aSRrD-CU-OCmyxkmPdxBiVVsWUu7uUvhFfvqhPDXBkcUHOjM
+- name: tilt-10350
+  user:
+    token: qQ6bTSsE-DV-PDnzylnQeyCjWWXtVv8vVwiIgwriQEYClVIPkN

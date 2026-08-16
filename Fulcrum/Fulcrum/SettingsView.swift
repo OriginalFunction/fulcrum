@@ -1,0 +1,69 @@
+import SwiftUI
+import FulcrumKit
+
+struct SettingsView: View {
+    @Bindable var settings: SettingsStore
+    let notificationPresenter: NotificationPresenter
+    let notifications: NotificationCoordinator
+
+    var body: some View {
+        Form {
+            Picker("Appearance", selection: $settings.appearance) {
+                ForEach(AppearanceMode.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            Picker("Menu bar icon", selection: $settings.iconMode) {
+                ForEach(MenuBarIconMode.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            Picker("Show failures in menu", selection: $settings.failuresInMenu) {
+                ForEach(FailuresInMenu.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            Picker("JSON blocks", selection: $settings.jsonPresentation) {
+                ForEach(JSONPresentation.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            Section {
+                Picker("Notifications", selection: $settings.notificationPolicy) {
+                    ForEach(NotificationPolicy.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                // Turning the policy on is an explicit opt-in and therefore a
+                // legitimate moment to settle the system permission — see
+                // `NotificationCoordinator.policyDidChange()`.
+                .onChange(of: settings.notificationPolicy) { notifications.policyDidChange() }
+
+                // A picker that quietly does nothing because macOS is blocking
+                // the app is this project's most repeated failure. The notice
+                // is derived in `FulcrumKit` (`NotificationSettingsNotice`),
+                // where it is actually testable; this view only renders it.
+                if let notice = NotificationSettingsNotice.notice(
+                    policy: settings.notificationPolicy,
+                    authorization: notificationPresenter.authorization
+                ) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label(notice.message, systemImage: notice.offersSystemSettings
+                              ? "exclamationmark.triangle.fill" : "info.circle")
+                            .font(.callout)
+                            .foregroundStyle(notice.offersSystemSettings ? .primary : .secondary)
+                        if notice.offersSystemSettings {
+                            Button("Open Notification Settings…") {
+                                NotificationSystemSettings.open()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 420)
+        // The permission can change while this pane is open — the user can
+        // walk to System Settings and back without Fulcrum being told.
+        .onAppear { notificationPresenter.refreshAuthorization() }
+        // Carried since plan 1: Light/Dark/System applied to every other
+        // surface but this one. Settings is a real SwiftUI `Settings` scene
+        // (see `AppearanceMode.colorScheme`'s doc comment for why that means
+        // this, not `DashboardWindowController`'s manual `NSWindow.appearance`
+        // pattern, is the right fix here) — reading `settings.appearance`
+        // directly in `body` means a change made while this pane is open
+        // takes effect immediately, the same as every other setting on this
+        // form.
+        .preferredColorScheme(settings.appearance.colorScheme)
+    }
+}
