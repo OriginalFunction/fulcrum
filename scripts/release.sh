@@ -32,6 +32,12 @@
 #   staple              Puts the notarization ticket inside the artifact, so
 #                       Gatekeeper accepts it offline. Without it a first launch
 #                       on a machine with no network is rejected.
+#   clean tree + tag    The script refuses to run on a dirty tree and tags the
+#                       release itself, recording the DMG's md5 and byte count in
+#                       the tag message. v1.0 shipped untagged; when a bug in it
+#                       had to be debugged a day later, the build commit could
+#                       only be reconstructed from the DMG's mtime, and the tree
+#                       it was built from could not be established at all.
 #   CODE_SIGN_INJECT_   Xcode otherwise injects `com.apple.security.
 #     BASE_ENTITLEMENTS   get-task-allow` — the entitlement that lets a debugger
 #     =NO                 attach — into Release builds too. Notarization rejects
@@ -68,6 +74,22 @@ esac
 xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1 \
   || fail "no notarization credentials stored under profile '$PROFILE' — see the header of this script"
 
+# A release tag has to mean something, and it can only mean "this commit built
+# that artifact" if the tree was clean when the artifact was built. v1.0 shipped
+# untagged from a working tree nobody recorded; a day of debugging a v1.0 bug
+# later, the build commit had to be reconstructed from the DMG's mtime.
+#
+# `--porcelain` covers staged, unstaged and untracked alike. Untracked files are
+# included deliberately: a source file that was never added is exactly the kind
+# of thing that builds locally and is missing from the tag.
+[ -z "$(git status --porcelain)" ] \
+  || fail "working tree is not clean — commit or stash before releasing, so the tag identifies what shipped"
+
+# Captured BEFORE the script edits site/www/index.html below. That edit is a
+# real change to the tree, so reading HEAD later would still be correct, but
+# reading it here makes the ordering explicit rather than incidental.
+COMMIT="$(git rev-parse HEAD)"
+
 say "Running tests"
 swift test 2>&1 | tail -3
 
@@ -83,6 +105,18 @@ xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
 VERSION="$(defaults read "$APP/Contents/Info" CFBundleShortVersionString)"
 BUILD="$(defaults read "$APP/Contents/Info" CFBundleVersion)"
 say "Built Fulcrum $VERSION ($BUILD)"
+
+# Checked here rather than before the build, because the version lives in the
+# built Info.plist and reading it any earlier means trusting a second source.
+# Here still costs only the build — it is ahead of notarization, which is the
+# slow step and the one that reaches the network.
+TAG="v$VERSION"
+if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+  # `$TAG^{}` dereferences to the commit. Without it an ANNOTATED tag resolves
+  # to the tag object's own sha, which appears nowhere in `git log` and sends
+  # the reader looking for a commit that does not exist.
+  fail "$TAG already exists (at $(git rev-parse --short "$TAG^{}")) — bump MARKETING_VERSION, or delete the tag if that release was never published"
+fi
 
 # Prove the *right* identity was used. A build signed with the development
 # certificate reaches this point looking healthy.
@@ -167,11 +201,64 @@ esac
 xcrun stapler validate "$APP" || fail "the app has no valid stapled ticket"
 xcrun stapler validate "$DMG" || fail "the disk image has no valid stapled ticket"
 
+say "Tagging the release"
+# Placed here, after stapling, because this is the first point at which a
+# shippable artifact exists: everything above can fail, and a tag for a release
+# that was never produced is worse than no tag.
+#
+# The digest and byte count go in the message so the tag answers the question
+# that actually gets asked later — "is the file on the CDN the one this commit
+# built?" — without needing the build machine or the DMG that produced it.
+DMG_MD5="$(md5 -q "$DMG")"
+DMG_BYTES="$(stat -f%z "$DMG")"
+git tag -a "$TAG" "$COMMIT" -m "Fulcrum $VERSION ($BUILD)
+
+Signed Developer ID (team AVWF3ADBT2), notarized and stapled by
+scripts/release.sh.
+
+  $(basename "$DMG")  $DMG_BYTES bytes  md5 $DMG_MD5
+
+Compare against what is published:
+  curl -sI https://fulcrum.originalfunction.com/download/$(basename "$DMG")
+The ETag of a single-part S3 upload is its md5." \
+  || fail "could not create tag $TAG"
+echo "  tagged $TAG at $(git rev-parse --short "$COMMIT")"
+
+# Pushed, but not fatally: the tag exists locally either way, and this developer
+# works from behind a VPN where a push can fail for reasons that have nothing to
+# do with the release. Failing the whole run here would throw away a good build.
+if git push origin "$TAG" 2>/dev/null; then
+  echo "  pushed $TAG to origin"
+else
+  printf '\033[33m  could not push %s — run: git push origin %s\033[0m\n' "$TAG" "$TAG"
+fi
+
+say "Updating the site's download link"
+# The page in site/www/ is the source of truth for what the site advertises,
+# so the version and filename are rewritten here rather than being edited by
+# hand — a published page pointing at a DMG that no longer exists is a broken
+# download nobody notices until someone reports it.
+PAGE="$ROOT/site/www/index.html"
+/usr/bin/sed -i '' \
+  -e "s|href=\"/download/Fulcrum-[^\"]*\.dmg\"|href=\"/download/Fulcrum-$VERSION.dmg\"|" \
+  -e "s|Version [0-9][^ ]* ·|Version $VERSION ·|" \
+  "$PAGE"
+grep -q "Fulcrum-$VERSION.dmg" "$PAGE" || fail "could not update the download link in $PAGE"
+
 say "Done"
 echo "  $DMG"
+echo "  tagged $TAG"
 echo
-echo "Before publishing, verify it the way a stranger will — a quarantined copy,"
-echo "not this one, which the build process has already blessed:"
+echo "site/www/index.html now points at $VERSION and is UNCOMMITTED. That edit is"
+echo "deliberately not in $TAG — the tag identifies the sources that built the app,"
+echo "and the page is not one of them. Commit it before deploying the site stack."
+echo
+echo "Verify it the way a stranger will — a quarantined copy, not this one,"
+echo "which the build process has already blessed:"
 echo
 echo "  xattr -w com.apple.quarantine '0081;00000000;Safari;' \"$DMG\""
 echo "  open \"$DMG\"     # drag to Applications, launch, expect no warning"
+echo
+echo "Then publish (needs the site stack deployed):"
+echo
+echo "  scripts/publish.sh \"$DMG\""

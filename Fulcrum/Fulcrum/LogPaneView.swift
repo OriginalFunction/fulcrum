@@ -76,6 +76,17 @@ struct LogPaneView: View {
         .onChange(of: dashboard.selectedInstance?.id, initial: true) { _, _ in
             pane.follow(dashboard.selectedInstance)
         }
+        // `SettingsStore` is a separate `@Observable`, so nothing inside
+        // `DashboardModel` can react to the picker moving on its own — a
+        // view's `body` re-evaluating is the only hook there is (same reason
+        // the `follow` line above exists). The decision itself lives in
+        // `DashboardModel.applyLogScrollbackSetting()`, where it is testable;
+        // this is only the trigger. It applies to the LIVE buffer, mid-stream
+        // — see `LogPaneModel.setCapacity(_:)` for what that does and does
+        // not disturb.
+        .onChange(of: settings.logScrollback, initial: true) { _, _ in
+            dashboard.applyLogScrollbackSetting()
+        }
     }
 
     private var logBackground: Color {
@@ -137,10 +148,16 @@ struct LogPaneView: View {
                 // rows instead of a wall of wrapped raw text. Ordinary lines
                 // still render exactly as `LogLineRow` always has.
                 LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(pane.rows) { row in
+                    ForEach(pane.rows) { scored in
                         LogRowView(
-                            row: row,
-                            health: health(for: row, in: healthByName),
+                            row: scored.row,
+                            // Read off the row, never recomputed here.
+                            // `SeverityScanner` runs once per line snapshot
+                            // inside `LogPaneModel`'s cached derivation (see
+                            // `ScoredRow`); calling it from a `body` would put
+                            // a whole-buffer scan back into every render.
+                            severity: scored.severity,
+                            health: health(for: scored.row, in: healthByName),
                             pane: pane,
                             settings: settings
                         )
@@ -165,6 +182,19 @@ struct LogPaneView: View {
             .onChange(of: pane.rows.count) { _, _ in
                 guard pane.isFollowing else { return }
                 proxy.scrollTo(Self.bottomID, anchor: .bottom)
+            }
+            // "Jump to next error", driven from the filter bar — which has no
+            // `ScrollViewProxy` of its own, so the model carries the target
+            // and this is where it becomes a scroll.
+            //
+            // Watches the GENERATION, not `focusedErrorID`: with one failing
+            // row on screen every jump wraps back onto the same id, so the id
+            // never changes and an `onChange` on it would scroll once and then
+            // sit dead while the user kept clicking. See
+            // `LogPaneModel.errorJumpGeneration`.
+            .onChange(of: pane.errorJumpGeneration) { _, _ in
+                guard let target = pane.focusedErrorID else { return }
+                withAnimation { proxy.scrollTo(target, anchor: .center) }
             }
             .onAppear {
                 proxy.scrollTo(Self.bottomID, anchor: .bottom)
@@ -252,6 +282,10 @@ struct LogPaneView: View {
             reasons.append("the source filter")
             waysOut.append("“Clear”")
         }
+        if cause.contains(.errorsOnly) {
+            reasons.append("“Errors only”")
+            waysOut.append("the “Errors only” checkbox")
+        }
 
         let reasonList = reasons.joined(separator: " and ")
         let wayOutList = waysOut.joined(separator: " or ")
@@ -320,6 +354,54 @@ private enum LogColumnLayout {
     static let messageLeadingIndent: CGFloat = borderWidth + timeWidth + resourceWidth + 18
 }
 
+/// Reserves the border column's WIDTH at the head of a `.firstTextBaseline`
+/// row, contributing no height and no baseline of its own.
+///
+/// The `height: 0` is the whole point, and it is not cosmetic. A `Color` is
+/// vertically flexible and has no text baseline, so a bare
+/// `Color.clear.frame(width: 3)` in a baseline-aligned `HStack` does two
+/// damaging things at once: SwiftUI falls back to its BOTTOM edge as the
+/// baseline, and it accepts whatever height it is proposed rather than
+/// reporting a bounded one. The stack then aligns the text's first baseline to
+/// the bottom of a box whose height nothing constrains — so the row's bounds
+/// run above the text, by an amount that depends on the height the layout
+/// happens to settle on. Measured offscreen with `ImageRenderer` at 2x, that
+/// was 13px of empty band above the ink on a single-line row, 86px on a
+/// wrapped one, and the entire canvas when the row was handed a definite
+/// height (the same failure `LogColumnHeaderView` once hit for ~400pt). With
+/// `.background` behind the row that empty band is visible as a severity wash
+/// floating above its own text — which is what this reserves the column
+/// without doing.
+///
+/// A zero-height view has bottom == top, so it sits exactly ON the baseline
+/// and adds nothing in either direction. The row's height is then the text's,
+/// which is what it was always meant to be.
+private struct BorderColumnSpacer: View {
+    var body: some View {
+        Color.clear.frame(width: LogColumnLayout.borderWidth, height: 0)
+    }
+}
+
+private extension View {
+    /// Draws the health bar down the row's leading edge, in the column
+    /// `BorderColumnSpacer` reserved. An `.overlay` because the bar must be
+    /// sized BY the row, never the other way round: as a child of the row's
+    /// `HStack` a `Color` dictates the row's height instead of following it
+    /// (see `BorderColumnSpacer`). An overlay is measured from its parent and
+    /// contributes nothing back, so the bar spans exactly the text's height —
+    /// including every line of a wrapped message, which as an `HStack` child
+    /// it did not.
+    ///
+    /// `nil` health stays `.clear`, not green: an unknown resource must not
+    /// read as a healthy one. See `LogLineRow.health`.
+    func healthBorder(_ health: ResourceHealth?) -> some View {
+        overlay(alignment: .leading) {
+            (health.map(Theme.color(for:)) ?? .clear)
+                .frame(width: LogColumnLayout.borderWidth)
+        }
+    }
+}
+
 /// The pane's column labels, directly beneath the filter bar — without them
 /// the three columns relied on position alone. Styled after
 /// `ResourceTableView`'s own header chrome (see this file's `banner(...)`,
@@ -328,7 +410,7 @@ private enum LogColumnLayout {
 private struct LogColumnHeaderView: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Color.clear.frame(width: LogColumnLayout.borderWidth)
+            BorderColumnSpacer()
             Text("Time")
                 .frame(width: LogColumnLayout.timeWidth, alignment: .leading)
             Text("Resource")
@@ -337,13 +419,15 @@ private struct LogColumnHeaderView: View {
         }
         .font(.caption2.weight(.semibold))
         .foregroundStyle(Theme.textSecondary)
-        // A `Color` is an infinitely expandable shape, and `.frame(width:)`
-        // constrains only its width — the leading `Color.clear` that reserves
-        // the border column stays greedy vertically. In a row that is exactly
-        // right: the bar should span whatever height the text gives it. Here
-        // the header sits in a `VStack` beside a greedy `ScrollView`, so the
-        // unconstrained height let it claim ~400pt of the pane. Sizing to the
-        // ideal height clamps it back to the text.
+        // `BorderColumnSpacer` is what keeps this header the height of its own
+        // labels. A bare `Color.clear.frame(width:)` here — which is what this
+        // was — is vertically greedy, and the header sits in a `VStack` beside
+        // a greedy `ScrollView`, so the unconstrained height once let it claim
+        // ~400pt of the pane. `.fixedSize` clamped the height back but not the
+        // baseline: measured offscreen it still pushed these labels 3pt below
+        // centre in their own chrome band, leaving their descenders 1pt off
+        // the bottom edge. The zero-height spacer fixes both, and this stays
+        // as the guard it has been since that ~400pt build.
         .fixedSize(horizontal: false, vertical: true)
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
@@ -378,8 +462,7 @@ private struct LogLineRow: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
-            (health.map(Theme.color(for:)) ?? .clear)
-                .frame(width: LogColumnLayout.borderWidth)
+            BorderColumnSpacer()
             Text(LogTimeFormat.formatter.string(from: line.time))
                 .foregroundStyle(Theme.textSecondary)
                 .frame(width: LogColumnLayout.timeWidth, alignment: .leading)
@@ -391,6 +474,7 @@ private struct LogLineRow: View {
             Text(attributedMessage)
                 .textSelection(.enabled)
         }
+        .healthBorder(health)
     }
 
     /// `ANSI.parse(_:)` (pure, from `FulcrumKit`) does the actual escape
@@ -415,13 +499,49 @@ private struct LogLineRow: View {
 /// from before blocks rendered as a tree) or a JSON block (`LogBlockRow`,
 /// Task 5/6). A thin `switch`, not a protocol or `AnyView`: `LogRow` is
 /// already a two-case enum, so this is just following its shape.
+///
+/// This is also where the SEVERITY WASH goes, once, wrapping whichever of the
+/// two the row is — rather than in each of them separately, which is two
+/// places to change the day the tint does. A `.background` draws BEHIND its
+/// content, which is the whole requirement: the message already carries the
+/// emitter's own ANSI colours (`Theme.color(forAnsi:)`) and those have to stay
+/// legible, so the tint may sit behind the text and never over it.
+///
+/// `.frame(maxWidth: .infinity, alignment: .leading)` is what makes the band
+/// span the pane rather than stopping at the end of the message: an `HStack`
+/// sizes to its content, and a wash that ended mid-row would read as a
+/// highlight of the text rather than a mark on the line. It changes the row's
+/// width, not its height.
+///
+/// The row's HEIGHT is only honest because of `BorderColumnSpacer` — read that
+/// before touching either row's `HStack`. A `.background` can only be as
+/// well-aligned as the bounds it fills, and while the health bar was a plain
+/// `Color` child of a `.firstTextBaseline` `HStack` those bounds ran well above
+/// the text, so the wash did too. That is a defect of the ROW, not of the
+/// wash; the wash merely made it visible. Nothing here should ever be nudged
+/// by a padding constant to compensate — the error was never constant (13px on
+/// a single-line row, 86px on a wrapped one, measured at 2x), so a constant
+/// could not have cancelled it.
 private struct LogRowView: View {
     let row: LogRow
+    /// Scored by `SeverityScanner` inside `LogPaneModel`'s cached derivation
+    /// and handed down — this view never asks for it itself.
+    let severity: LogSeverity
     let health: ResourceHealth?
     let pane: LogPaneModel
     let settings: SettingsStore
 
     var body: some View {
+        rowContent
+            .frame(maxWidth: .infinity, alignment: .leading)
+            // The `@ViewBuilder` form, not `?? .clear`: `Optional` conforms to
+            // `View`, so `nil` here adds nothing to the hierarchy at all,
+            // which is what an ordinary row should cost.
+            .background { Theme.wash(for: severity) }
+    }
+
+    @ViewBuilder
+    private var rowContent: some View {
         switch row {
         case .line(let buffered):
             LogLineRow(line: buffered.line, health: health)
@@ -499,8 +619,7 @@ private struct LogBlockRow: View {
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
-            (health.map(Theme.color(for:)) ?? .clear)
-                .frame(width: LogColumnLayout.borderWidth)
+            BorderColumnSpacer()
             Text(origin.map { LogTimeFormat.formatter.string(from: $0.time) } ?? "")
                 .foregroundStyle(Theme.textSecondary)
                 .frame(width: LogColumnLayout.timeWidth, alignment: .leading)
@@ -523,6 +642,11 @@ private struct LogBlockRow: View {
             }
             .buttonStyle(.plain)
         }
+        // On the HEADER, not on `body`'s `VStack`: the bar marks the log line
+        // this block came from, and an expanded tree is that line's contents,
+        // not more lines. Running it down the tree too would claim a resource
+        // health for rows that are not log rows at all.
+        .healthBorder(health)
     }
 
     private var originResourceLabel: String {

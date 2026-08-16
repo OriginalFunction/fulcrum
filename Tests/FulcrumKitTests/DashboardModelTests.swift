@@ -656,30 +656,87 @@ private func event(name: String, update: String, order: Int, group: String? = ni
     #expect(!active.contains(instance(port: 10360).id))
 }
 
-/// Polls `stub.activeInstanceIDs` until it stops changing (or a deadline
-/// passes), then returns whatever it settled on. Bounded so a permanent
-/// leak — the active set never stabilising — fails the caller's `#expect`
-/// instead of hanging: exactly the "count, don't hang" shape this project's
-/// other stream-lifecycle tests already use (see `LogStreamerTests.within`).
+/// Waits for the stub's streams to CONVERGE — for exactly one call to
+/// `stream(instance:tail:)` to still be live — and then reports which
+/// instance that surviving stream belongs to.
+///
+/// The condition is counted, not timed. This helper used to define "settled"
+/// as "the observed set has not changed for 200ms", which is a wall-clock
+/// proxy for the thing the callers actually assert about: every superseded
+/// stream has terminated. The two are not the same. `LogPaneModel.follow(_:)`
+/// cancels the outgoing session, but cancelling a `Task` the executor has not
+/// yet scheduled does not fire the stream's `onTermination` until it does —
+/// and `StubLogStreaming` only drops a stream from `active` from that
+/// callback. Under swift-testing's parallel execution the gap between two
+/// `onTermination` firings can exceed any quiet period you pick, at which
+/// point the poll called an intermediate state settled and handed back a set
+/// still carrying a superseded stream's instance. That failed on correct
+/// code, 2 runs in 11. `StubLogStreaming.delayTerminationReporting(for:by:)`
+/// reproduces it on demand, and
+/// `settledActiveInstanceIDsWaitsForEveryStreamToTerminateNotForTheClockToGoQuiet`
+/// below holds this helper to the counted answer.
+///
+/// It counts live *streams* rather than live instance ids on purpose:
+/// `activeInstanceIDs` collapses two live streams for the same instance into
+/// one element, and `rapidlySwitchingLeavesNoInstanceOtherThanTheLastOneActive`
+/// switches away from 10370 and back to it — so "one id left" is true there
+/// while an earlier 10370 stream is still winding down, and only "one stream
+/// left" means converged. Both callers open exactly one stream per selection
+/// (3 and 5 respectively) and correctly leave exactly one alive.
+///
+/// The deadline is a hang-guard, not an assertion about speed: nothing here
+/// requires convergence to happen *within* it. On the mutation these tests are
+/// written against — teardown moved after the new session is installed, so the
+/// superseded streams are never cancelled at all — the count never reaches 1,
+/// and returning the un-converged set makes the caller's `#expect` fail while
+/// naming the leaked instances, which is strictly more useful than hanging or
+/// than throwing a bare timeout. 10s is the same bound the process-reaping
+/// waits in `LogStreamerTests` and `DashboardLogLifecycleTests` use, and it is
+/// 50x the 200ms window that was not enough.
 @MainActor private func settledActiveInstanceIDs(
     _ stub: StubLogStreaming,
-    quietPeriod: Double = 0.2,
     timeout: Double = 10
 ) async throws -> Set<TiltInstance.InstanceID> {
     let deadline = Date().addingTimeInterval(timeout)
-    var lastObserved = stub.activeInstanceIDs
-    var lastChanged = Date()
-    while Date() < deadline {
+    while stub.activeStreamCount != 1 && Date() < deadline {
         try await Task.sleep(nanoseconds: 20_000_000)
-        let current = stub.activeInstanceIDs
-        if current != lastObserved {
-            lastObserved = current
-            lastChanged = Date()
-        } else if Date().timeIntervalSince(lastChanged) >= quietPeriod {
-            return current
-        }
     }
-    return lastObserved
+    return stub.activeInstanceIDs
+}
+
+/// The guard that keeps `settledActiveInstanceIDs` honest, and the only
+/// reason `StubLogStreaming.delayTerminationReporting(for:by:)` exists.
+///
+/// This is the flake itself, made deterministic. The helper used to return as
+/// soon as the observed instance set had held still for 200ms; here the two
+/// superseded streams that must disappear from the answer take a full second
+/// to report their termination, so a quiet-clock helper reads the
+/// intermediate state as settled and hands back a set still containing 10360.
+/// Measured against the previous helper this failed 10 runs out of 10 — the
+/// real flake failed 2 in 11 — and against this one it passes 10 out of 10.
+///
+/// Both defects the old helper had are covered. 10360 is a superseded stream
+/// for a DIFFERENT instance, which must not appear in the answer at all.
+/// 10370 is superseded by a later stream for the SAME instance (the fourth
+/// switch selects it again), so the count of distinct active *ids* is 1 while
+/// two streams are still live — which is why the helper counts streams, and
+/// why `activeStreamCount` is asserted here rather than only the id set.
+@Test(.timeLimit(.minutes(1))) @MainActor func settledActiveInstanceIDsWaitsForEveryStreamToTerminateNotForTheClockToGoQuiet() async throws {
+    let stub = StubLogStreaming()
+    let (dashboard, app, _) = makeDashboard(logStreaming: stub)
+    app.sync(with: [instance(port: 10350), instance(port: 10360), instance(port: 10370)])
+    stub.delayTerminationReporting(for: instance(port: 10360).id, by: .seconds(1))
+    stub.delayTerminationReporting(for: instance(port: 10370).id, by: .seconds(1))
+
+    dashboard.logPane.follow(dashboard.selectedInstance)
+    dashboard.selectedSidebarID = "port-10360"
+    dashboard.selectedSidebarID = "port-10370"
+    dashboard.selectedSidebarID = "port-10350"
+    dashboard.selectedSidebarID = "port-10370"
+
+    let active = try await settledActiveInstanceIDs(stub)
+    #expect(active == [instance(port: 10370).id])
+    #expect(stub.activeStreamCount == 1, "returned before the superseded streams had actually terminated")
 }
 
 /// The other half of `logPane`'s doc comment: discovery reconciling the live
@@ -1365,4 +1422,58 @@ private final class ProbeCounter: @unchecked Sendable {
     #expect(dashboard.selectedTiltfilePath == "/b/Tiltfile")
     dashboard.selectedSidebarID = "port-10350"
     #expect(dashboard.selectedTiltfilePath == "/a/Tiltfile")
+}
+
+// MARK: - Log scrollback preference
+
+@Test @MainActor func theLogPaneIsBuiltWithTheStoredScrollbackSetting() {
+    // Not with `LogPaneModel.defaultCapacity`, which is 5,000 and is only the
+    // fallback for a pane built without one. A dashboard that ignored the
+    // stored preference until something happened to change it would give the
+    // user 5,000 lines on every launch however they had set it.
+    let app = AppModel(
+        settings: SettingsStore(defaults: TestUserDefaults.fresh()),
+        aliasesDefaults: TestUserDefaults.fresh()
+    )
+    app.settings.logScrollback = .lines500
+    let dashboard = DashboardModel(
+        appModel: app, recents: RecentsStore(storage: InMemoryRecentsStorage())
+    )
+    #expect(dashboard.logPane.capacity == 500)
+}
+
+@Test @MainActor func applyingTheScrollbackSettingResizesTheLivePane() {
+    // `SettingsStore` is a separate `@Observable`, so nothing here can react
+    // to the picker moving on its own — `LogPaneView` pushes it in. This is
+    // the decision half of that push, which is why it lives in `FulcrumKit`
+    // where it can be tested without SwiftUI.
+    let (dashboard, app, _) = makeDashboard(logStreaming: StubLogStreaming())
+    #expect(dashboard.logPane.capacity == 1_000, "the shipped default")
+    for i in 1...1_000 { dashboard.logPane.receive(line(message: "m\(i)")) }
+    dashboard.logPane.refreshIfNeeded()
+
+    app.settings.logScrollback = .lines500
+    dashboard.applyLogScrollbackSetting()
+
+    #expect(dashboard.logPane.capacity == 500)
+    #expect(dashboard.logPane.lines.count == 500)
+    #expect(dashboard.logPane.lines.first?.line.message == "m501", "the newest 500 survive")
+}
+
+@Test @MainActor func applyingAnUnchangedScrollbackSettingIsANoOp() {
+    // `LogPaneView` calls this on every `onChange`, `initial: true` included,
+    // so the common case is "nothing changed". It must not republish the
+    // buffer there — see
+    // `setCapacityToTheCapacityAlreadyInForceDoesNotRepublish`.
+    let (dashboard, _, _) = makeDashboard(logStreaming: StubLogStreaming())
+    for i in 1...100 { dashboard.logPane.receive(line(message: "m\(i)")) }
+    dashboard.logPane.refreshIfNeeded()
+    _ = dashboard.logPane.rows
+    let recomputesBefore = dashboard.logPane.rowsRecomputeCount
+
+    dashboard.applyLogScrollbackSetting()
+
+    _ = dashboard.logPane.rows
+    #expect(dashboard.logPane.capacity == 1_000)
+    #expect(dashboard.logPane.rowsRecomputeCount == recomputesBefore)
 }

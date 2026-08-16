@@ -4,14 +4,18 @@ import FulcrumKit
 
 /// The log pane's own filter bar — a second, independent filter/search bar
 /// from `FilterBarView`'s (that one filters the resource table by name;
-/// this one filters `LogPaneModel.lines` by text and source). Order left to
-/// right matches tilt's own log-view controls: search, regex toggle, source,
-/// then Clear.
+/// this one filters `LogPaneModel.lines` by text, severity and source). Order
+/// left to right matches tilt's own log-view controls: search, regex toggle,
+/// Errors only, source, then Clear — with the error count and "Next error"
+/// pushed to the trailing edge beside Copy, where they read as navigation
+/// rather than as another filter.
 ///
 /// There is deliberately no level picker — see `LogFilter`'s doc comment for
 /// why it was removed rather than shipped non-functional: a 24,128-line
 /// sample of the developer's real project, and live `tilt logs --json`
-/// against two running instances, were 100% `level: "info"`.
+/// against two running instances, were 100% `level: "info"`. "Errors only" is
+/// its replacement, and the difference is that it reads signals the emitter
+/// actually stated rather than a field tilt never sets.
 struct LogFilterBarView: View {
     @Bindable var pane: LogPaneModel
     /// Read-only here: only `selectedResourceName` (for the scope chip) and
@@ -71,6 +75,14 @@ struct LogFilterBarView: View {
             Toggle("Regex", isOn: $pane.filter.isRegex)
                 .toggleStyle(.checkbox)
 
+            // The honest replacement for the level dropdown removed in v1 —
+            // see `LogFilter.errorsOnly`. Same idiom as `Regex` beside it: a
+            // checkbox bound straight through to a `LogFilter` field, so the
+            // `rows` cache keys on it for free.
+            Toggle("Errors only", isOn: $pane.filter.errorsOnly)
+                .toggleStyle(.checkbox)
+                .help("Show only rows scored as an error or worse")
+
             Picker("Source", selection: sourceBinding) {
                 Text("All").tag(SourceOption.all)
                 Text("Build").tag(SourceOption.build)
@@ -94,9 +106,16 @@ struct LogFilterBarView: View {
 
             Spacer()
 
+            errorNavigator
+
             Button("Copy") { copyVisibleLines() }
                 .help("Copy the lines currently shown to the clipboard")
-                .disabled(pane.filteredLines.isEmpty)
+                // `rows`, not `filteredLines`, and the two cannot disagree:
+                // `filteredLines` IS `rows` flattened, and every row covers at
+                // least one line (`LogRow.lines`), so "no rows" and "no lines
+                // to copy" are the same fact. This reads the cached array
+                // rather than flattening it on every render.
+                .disabled(pane.rows.isEmpty)
         }
         .font(.caption)
         .foregroundStyle(Theme.textPrimary)
@@ -105,6 +124,89 @@ struct LogFilterBarView: View {
         .background(Theme.chrome)
         .overlay(alignment: .bottom) {
             Rectangle().fill(Theme.separator).frame(height: 1)
+        }
+        // "All 2 errors are hidden by the filter" stops being true the moment
+        // the filter changes, and "no errors in this buffer" stops being true
+        // the moment one arrives. Neither may sit there contradicting the
+        // count beside it.
+        .onChange(of: pane.filter) { _, _ in jumpNotice = nil }
+        .onChange(of: pane.errorCount) { _, _ in jumpNotice = nil }
+    }
+
+    // MARK: - Errors: the count, and the way to them
+
+    /// What the last "Next error" press did, when that was something the user
+    /// needs told. `nil` whenever the last press simply moved the pane, and
+    /// cleared whenever the filter or the buffer changes underneath it so a
+    /// stale complaint never outlives the situation that produced it.
+    ///
+    /// View state, not model state, deliberately. `LogPaneModel` returns the
+    /// typed DECISION (`ErrorJump`) and this is the only place that turns one
+    /// into words — the same split `EmptyState` already uses, and the reason
+    /// which case applies stays testable in `FulcrumKit` while the wording
+    /// stays here where nothing can test it anyway.
+    @State private var jumpNotice: LogPaneModel.ErrorJump?
+
+    /// The count and the jump, together: the count states that failures
+    /// EXIST, the button reaches them. Separating them would leave a number
+    /// with no way to act on it and a button with no reason to press it.
+    @ViewBuilder
+    private var errorNavigator: some View {
+        if let notice = jumpNoticeText {
+            Text(notice)
+                .foregroundStyle(Theme.textSecondary)
+                .lineLimit(1)
+        }
+
+        // `pane.errorCount` is the UNFILTERED buffer's count — it does not
+        // move when the user searches. See its doc comment: a count that
+        // dropped to zero because you searched for something else would state,
+        // falsely, that the stream is clean.
+        Text(errorCountText)
+            .foregroundStyle(pane.errorCount > 0 ? Color(.statusError) : Theme.textSecondary)
+            .help("Rows scored as an error or worse in the whole buffer, whatever the filter shows")
+
+        Button {
+            let outcome = pane.jumpToNextError()
+            // Only the two "nowhere to go" outcomes are worth saying out
+            // loud; a jump that moved the pane has already shown its own
+            // result on screen.
+            switch outcome {
+            case .moved, .wrapped: jumpNotice = nil
+            case .noErrorsInBuffer, .everyErrorFilteredOut: jumpNotice = outcome
+            }
+        } label: {
+            // Plain text, matching `Clear` / `Copy` / `Show all resources`
+            // beside it rather than introducing a lone icon button into a bar
+            // that has none.
+            Text("Next error")
+        }
+        // Deliberately NOT disabled when the count is zero. A disabled button
+        // is this project's silent no-op wearing a nicer suit: it says "not
+        // now" without saying why, and the two reasons there is nothing to
+        // jump to — no failures at all, versus a filter hiding the ones the
+        // count beside it is advertising — are exactly what the user needs
+        // told apart. Pressing it always answers.
+        .help("Scroll to the next error, wrapping at the end")
+    }
+
+    private var errorCountText: String {
+        let count = pane.errorCount
+        return "\(count) \(count == 1 ? "error" : "errors")"
+    }
+
+    /// Turns the typed outcome into copy. Only ever called for a case the
+    /// model already decided — this never re-derives which situation applies
+    /// from `pane`'s own properties.
+    private var jumpNoticeText: String? {
+        switch jumpNotice {
+        case nil, .moved, .wrapped:
+            return nil
+        case .noErrorsInBuffer:
+            return "No errors in this buffer"
+        case .everyErrorFilteredOut(let errorCount):
+            let noun = errorCount == 1 ? "error is" : "errors are"
+            return "All \(errorCount) \(noun) hidden by the filter"
         }
     }
 

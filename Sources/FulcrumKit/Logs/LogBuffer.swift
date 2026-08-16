@@ -49,7 +49,11 @@ public struct BufferedLine: Sendable, Equatable, Hashable, Identifiable {
 /// O(n^2) overall, which does not survive the measured append rate (see
 /// `LogBufferTests.appendWritesStorageOnceRatherThanShiftingOnEviction`).
 public struct LogBuffer: Sendable {
-    public let capacity: Int
+    /// `private(set) var` rather than `let` because the user can change how
+    /// much scrollback the pane keeps while a stream is running — see
+    /// `resize(to:)`, and `SettingsStore.logScrollback` for why that is a
+    /// preference at all.
+    public private(set) var capacity: Int
 
     /// Backing storage, always exactly `capacity` slots. `nil` marks a slot
     /// that has never been written (only possible before the buffer first
@@ -59,8 +63,23 @@ public struct LogBuffer: Sendable {
     /// Index of the oldest live line in `storage`.
     private var head: Int = 0
 
-    /// Number of live lines currently held, from 0 up to `capacity`.
-    private var count: Int = 0
+    /// Number of live lines currently held, from 0 up to `capacity` — the
+    /// buffer's OCCUPANCY.
+    ///
+    /// Public because occupancy turned out to be the variable the log pane's
+    /// cost is actually driven by, and `LogPaneModel.adaptRefreshInterval(occupancy:)`
+    /// keys on it. Measured directly (`occupancy-hypothesis.md`, Result 2):
+    /// holding the arrival rate at 6 lines/sec AND the publication rate at
+    /// 5.93/sec and changing nothing but how many lines the buffer holds
+    /// moves main-thread availability 100.0% (500 lines) → 99.9% (1,000) →
+    /// 95.7% (2,500) → 74.7% (5,000).
+    ///
+    /// Already known here, so nothing new counts it: every one of `lines`,
+    /// `JSONBlock.detect`, `SeverityScanner` and `LogFilter` is O(this) per
+    /// publication, which is exactly why it is the right thing to decide from.
+    /// Reading it is O(1); reading `lines.count` would be an O(capacity) copy
+    /// to find out a number already stored here.
+    public private(set) var count: Int = 0
 
     /// The number the next appended line will be stamped with. Counts every
     /// line this buffer has EVER been given, not how many it currently holds —
@@ -122,6 +141,61 @@ public struct LogBuffer: Sendable {
             droppedCount += 1
         }
         return buffered
+    }
+
+    /// Rebuilds this buffer at `newCapacity`, KEEPING THE MOST RECENT lines
+    /// and counting whatever no longer fits as dropped. A no-op when the
+    /// capacity is unchanged.
+    ///
+    /// Exists because `SettingsStore.logScrollback` is a live preference: a
+    /// user who lowers it mid-stream must not have to relaunch, and — far more
+    /// importantly — must not lose the stream. The alternative shape, throwing
+    /// the buffer away and re-running `follow(_:)`, would restart
+    /// `tilt logs --follow` and blank the pane, which is a visible regression
+    /// dressed up as a setting.
+    ///
+    /// THE THREE INVARIANTS THIS PRESERVES, each of which something
+    /// user-visible is keyed to:
+    ///
+    /// * `nextSequence` is untouched, so every surviving line keeps the
+    ///   number it was stamped with. `LogRow.ID` is that number (see
+    ///   `BufferedLine`), and `LogPaneModel.expandedBlockIDs` and
+    ///   `focusedErrorID` are both keyed on it — an expanded JSON block stays
+    ///   expanded across a resize, and "jump to next error" resumes from where
+    ///   it was rather than from the top.
+    /// * The MOST RECENT lines survive a shrink, not the oldest. A log pane
+    ///   that discarded the newest lines to honour a smaller buffer would be
+    ///   answering a different question than the one the user asked.
+    /// * `droppedCount` absorbs everything discarded, so
+    ///   `LogPaneModel.droppedLinesMessage` stays true. Shrinking from 5,000
+    ///   to 1,000 with a full buffer states 4,000 more dropped lines
+    ///   immediately, because 4,000 lines were in fact dropped. This app
+    ///   states truncation rather than hiding it, and a resize is the one
+    ///   moment it would be easiest to hide.
+    ///
+    /// A shrink is exactly the eviction that appending would have performed
+    /// anyway, only sooner and in one step — which is why nothing downstream
+    /// needs a resize-specific case: every consumer of this buffer already
+    /// handles lines going away.
+    ///
+    /// `storageWrites` is deliberately NOT incremented. It is the seam
+    /// `LogBufferTests` uses to assert `append` is O(1), and a resize is
+    /// openly O(count); folding its writes into that counter would make the
+    /// append test's number depend on whether a resize had happened.
+    public mutating func resize(to newCapacity: Int) {
+        precondition(newCapacity > 0, "LogBuffer capacity must be positive")
+        guard newCapacity != capacity else { return }
+
+        let kept = lines.suffix(newCapacity)
+        droppedCount += count - kept.count
+
+        var rebuilt = [BufferedLine?](repeating: nil, count: newCapacity)
+        for (index, line) in kept.enumerated() { rebuilt[index] = line }
+
+        storage = rebuilt
+        head = 0
+        count = kept.count
+        capacity = newCapacity
     }
 
     /// A snapshot of the currently held lines, oldest first.

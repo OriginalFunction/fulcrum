@@ -20,6 +20,26 @@ struct SettingsView: View {
             Picker("JSON blocks", selection: $settings.jsonPresentation) {
                 ForEach(JSONPresentation.allCases, id: \.self) { Text($0.title).tag($0) }
             }
+            // Scrollback against responsiveness, said out loud. The picker
+            // alone would only offer four numbers and leave the user to work
+            // out that a bigger one costs them something — which is the whole
+            // reason the pane got slow enough to need this setting. The
+            // footer states the mechanism once; the caption under it states
+            // what the CURRENT choice actually costs, and both come from
+            // `FulcrumKit` (`LogScrollback.detail`) where the numbers behind
+            // them are documented against the measurements.
+            Section {
+                Picker("Log scrollback", selection: $settings.logScrollback) {
+                    ForEach(LogScrollback.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                Text(settings.logScrollback.detail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } footer: {
+                Text("How many lines the log pane keeps before it starts dropping the oldest. More scrollback to search back through costs responsiveness — the pane redoes work in proportion to how many lines it is holding, several times a second, so a bigger buffer makes the whole app slower for as long as the pane is open.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
             Section {
                 Picker("Notifications", selection: $settings.notificationPolicy) {
                     ForEach(NotificationPolicy.allCases, id: \.self) { Text($0.title).tag($0) }

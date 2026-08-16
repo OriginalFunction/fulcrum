@@ -18,3 +18,7 @@ DerivedData/
 *.cer
 *.mobileprovision
 AuthKey_*
+
+# CDK build output for the download site
+site/infra/node_modules/
+site/infra/cdk.out/

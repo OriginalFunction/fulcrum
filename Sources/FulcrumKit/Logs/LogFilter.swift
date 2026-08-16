@@ -38,17 +38,34 @@ public struct LogFilter: Sendable, Equatable {
     /// tilt-level messages are excluded — they belong to no resource, not to
     /// whichever one is selected.
     public var resource: String?
+    /// Keep only rows `SeverityScanner` scored at `.error` or above.
+    ///
+    /// This is the honest replacement for the minimum-level control described
+    /// above: that one read tilt's `level` field, which is `info` on every line
+    /// of a real project, so it could not narrow anything. This one reads
+    /// signals the emitter actually stated — a pino `level: 50`, a 5xx
+    /// `statusCode`, a serialised `err` object, an `ERROR:` label — measured to
+    /// flag 46 rows of a committed 3,461-line corpus with no false positives.
+    ///
+    /// A `Bool`, not a `LogSeverity` threshold. `.warning` is the level the
+    /// weakest signal (`ansi.red`) can reach, and a control that surfaces
+    /// "Flask printed its development-server banner in red" alongside a crash
+    /// is the noisy control this feature exists to avoid. Errors and fatals are
+    /// the two the user is hunting; the tint still shows warnings in place.
+    public var errorsOnly: Bool
 
     public init(
         query: String = "",
         isRegex: Bool = false,
         source: LogSource? = nil,
-        resource: String? = nil
+        resource: String? = nil,
+        errorsOnly: Bool = false
     ) {
         self.query = query
         self.isRegex = isRegex
         self.source = source
         self.resource = resource
+        self.errorsOnly = errorsOnly
     }
 
     /// True when `isRegex` is set and `query` fails to compile as a regular
@@ -84,6 +101,28 @@ public struct LogFilter: Sendable, Equatable {
     /// swift-testing's parallel execution, where the same compile-once code
     /// measured 4-5ms idle and 15.4ms loaded, both real, neither a
     /// regression).
+    ///
+    /// ## This overload cannot apply `errorsOnly`, and no pane path asks it to
+    ///
+    /// Severity is scored on a `LogRow`, not on a line, and that is not an
+    /// implementation detail to route around: a serialised `err: { … }`
+    /// spanning six lines is ONE failing thing, and not one of those six lines
+    /// is a failure by itself (`err: {` matches no rule at all). Teaching this
+    /// overload to score each line separately would therefore not close the
+    /// gap — it would answer a DIFFERENT question from the one the pane
+    /// answers, and quietly disagree with it about blocks instead of about the
+    /// gate.
+    ///
+    /// So the field is genuinely inexpressible here, and the fix is not to
+    /// express it but to make sure nothing user-facing arrives here needing
+    /// it. `LogPaneModel.filteredLines` — Copy's source, and the one path that
+    /// used to — is now flattened out of `rows`, so the pane and the clipboard
+    /// derive from a single filtering pass and cannot diverge on this field or
+    /// on any field added later. See `LogPaneModel.filteredLines`, and
+    /// `LogPaneModelTests.copyingTakesExactlyWhatThePaneShows`.
+    ///
+    /// What remains here is the line-level predicate: resource, source, query.
+    /// Callers wanting the pane's answer want `apply(to rows:)`.
     public func apply(to lines: [LogLine]) -> [LogLine] {
         applyCounting(to: lines, compilationCounter: nil)
     }
@@ -145,8 +184,38 @@ public struct LogFilter: Sendable, Equatable {
     /// compiled once per call here too, not once per row — see
     /// `LogFilterTests.regexIsCompiledOnceNotPerLine` and its row-based
     /// counterpart.
-    public func apply(to rows: [LogRow]) -> [LogRow] {
+    ///
+    /// ## Errors only
+    ///
+    /// `errorsOnly` is applied LAST, after record grouping, and that ordering
+    /// is the whole of what "both controls active means both applied" means
+    /// here. Gating BEFORE grouping would delete a record's header before
+    /// `LogRecord.group` ever saw it — the header is frequently the only row
+    /// that opens a record, so dropping it first turns the remaining
+    /// continuation rows into standalone ones and the query then keeps a
+    /// different set than it would have. Gating after leaves grouping to see
+    /// the stream it was measured against, and the user gets exactly the
+    /// intersection they asked for: the failing rows of the records that
+    /// matched their search.
+    ///
+    /// It takes `ScoredRow`s rather than scoring here so that
+    /// `LogPaneModel.rows` pays for `SeverityScanner` once per line snapshot
+    /// rather than once per filter edit — see `ScoredRow`'s own doc comment,
+    /// and `LogPaneModelTests.changingTheFilterDoesNotRescanSeverity`.
+    public func apply(to rows: [ScoredRow]) -> [ScoredRow] {
         applyCounting(to: rows, compilationCounter: nil)
+    }
+
+    /// The unscored counterpart of `apply(to rows: [ScoredRow])`, which scores
+    /// the rows itself before filtering them.
+    ///
+    /// Deliberately not an overload that IGNORES `errorsOnly`: a field on this
+    /// type that one `apply` honours and another silently drops is precisely
+    /// the silent no-op this project keeps shipping. Callers with no scores to
+    /// hand pay for the scan; `LogPaneModel` has scores to hand and uses the
+    /// overload above.
+    public func apply(to rows: [LogRow]) -> [LogRow] {
+        apply(to: rows.map(ScoredRow.init(scoring:))).map(\.row)
     }
 
     /// Runs resource, source, then text-query filtering, same as
@@ -164,11 +233,12 @@ public struct LogFilter: Sendable, Equatable {
     /// (for a text query only) the whole record that block sits in kept with
     /// it.
     private func applyCounting(
-        to rows: [LogRow],
+        to rows: [ScoredRow],
         compilationCounter: CompilationCounter?,
         recordGroupingCounter: RecordGroupingCounter? = nil
-    ) -> [LogRow] {
+    ) -> [ScoredRow] {
         let matches = matchPredicate(compilationCounter: compilationCounter)
+        let kept: [ScoredRow]
 
         // Source and resource filter literally — row by row, no records.
         // With nothing set at all the predicate accepts everything, so this
@@ -179,14 +249,18 @@ public struct LogFilter: Sendable, Equatable {
         // grouping passes rather than comparing output to input (with no
         // criterion set those are equal either way, so a result-only
         // assertion cannot see this guard at all).
-        guard hasTextQuery else {
-            return rows.filter { row in row.lines.contains { matches($0.line) } }
+        if hasTextQuery {
+            recordGroupingCounter?.increment()
+            kept = LogRecord.group(rows, firstLine: { $0.lines.first?.line }).flatMap { record in
+                record.contains { $0.lines.contains { matches($0.line) } } ? record : []
+            }
+        } else {
+            kept = rows.filter { row in row.lines.contains { matches($0.line) } }
         }
 
-        recordGroupingCounter?.increment()
-        return LogRecord.group(rows).flatMap { record in
-            record.contains { $0.lines.contains { matches($0.line) } } ? record : []
-        }
+        // Last, on purpose — see `apply(to rows: [ScoredRow])`'s doc comment.
+        guard errorsOnly else { return kept }
+        return kept.filter(\.isFailure)
     }
 
     /// Whether the text query is anything other than whitespace. A query of
@@ -290,13 +364,15 @@ extension LogFilter {
     /// Row-based counterpart of `apply(to:countingRegexCompilationsInto:)` —
     /// the same test-only counting seam, for `apply(to rows:)`.
     func apply(to rows: [LogRow], countingRegexCompilationsInto counter: CompilationCounter) -> [LogRow] {
-        applyCounting(to: rows, compilationCounter: counter)
+        applyCounting(to: rows.map(ScoredRow.init(scoring:)), compilationCounter: counter).map(\.row)
     }
 
     /// Same as `apply(to rows:)`, but increments `counter` once per record-
     /// grouping pass — which is at most one per call, and zero unless there
     /// is a text query. Test-only seam; see `RecordGroupingCounter`.
     func apply(to rows: [LogRow], countingRecordGroupingsInto counter: RecordGroupingCounter) -> [LogRow] {
-        applyCounting(to: rows, compilationCounter: nil, recordGroupingCounter: counter)
+        applyCounting(
+            to: rows.map(ScoredRow.init(scoring:)), compilationCounter: nil, recordGroupingCounter: counter
+        ).map(\.row)
     }
 }

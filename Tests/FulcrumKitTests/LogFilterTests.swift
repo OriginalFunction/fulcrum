@@ -81,11 +81,20 @@ import Testing
 }
 
 @Test func filtersCompose() {
+    // Every excluded line is excluded by exactly ONE of the three clauses, so
+    // each clause is load-bearing on its own. The fixture this replaces put
+    // the word "server" in both the message and the resource of everything it
+    // kept, which made query and resource redundant: deleting the resource
+    // check from `matchPredicate` left this test green.
     let lines = [
-        line(message: "server info", resource: "server", level: .info, source: .runtime),
-        line(message: "server other", resource: "server", level: .warn, source: .runtime),
-        line(message: "server build info", resource: "server", level: .info, source: .build),
-        line(message: "other info", resource: "other", level: .info, source: .runtime),
+        line(message: "server info", resource: "server", source: .runtime),
+        line(message: "server other", resource: "server", source: .runtime),
+        // Wrong source only — right resource, and the query matches.
+        line(message: "server build info", resource: "server", source: .build),
+        // Wrong resource only — right source, and the query matches.
+        line(message: "server info from elsewhere", resource: "other", source: .runtime),
+        // Query miss only — right resource, right source.
+        line(message: "listening on :8080", resource: "server", source: .runtime),
     ]
     let filter = LogFilter(query: "server", source: .runtime, resource: "server")
     #expect(filter.apply(to: lines).map(\.message) == ["server info", "server other"])
@@ -203,4 +212,70 @@ import Testing
     filter.query = #"status=\d{3}"#
     _ = filter.apply(to: lines, countingRegexCompilationsInto: counter)
     #expect(counter.count == 2)
+}
+
+// MARK: - Errors only
+//
+// The severity gate at the FILTER level. `LogPaneModelTests` covers what the
+// pane does with it; these state the composition rules the filter itself
+// owns — chiefly that the gate runs after record grouping, and that no
+// overload of `apply` may quietly ignore the field.
+
+@Test func errorsOnlyKeepsRowsAtErrorOrAboveAndNothingElse() {
+    let rows: [ScoredRow] = [
+        .init(scoring: .line(buffered(line(message: "GET /healthz 200")))),
+        .init(scoring: .line(buffered(line(message: "WARN: disk at 80%")))),
+        .init(scoring: .line(buffered(line(message: "ERROR: boom")))),
+        .init(scoring: .line(buffered(line(message: "FATAL: shutting down")))),
+    ]
+
+    let kept = LogFilter(errorsOnly: true).apply(to: rows)
+    #expect(kept.map { $0.lines.map(\.line.message).joined() } == ["ERROR: boom", "FATAL: shutting down"])
+    // Off, the same rows all survive — so the assertion above is the gate
+    // firing, not the fixture being small.
+    #expect(LogFilter().apply(to: rows).count == 4)
+}
+
+@Test func errorsOnlyIsHonouredByTheUnscoredOverloadToo() {
+    // `apply(to rows: [LogRow])` has no severities handed to it, so the
+    // tempting implementation is one that ignores `errorsOnly` — a field
+    // this type advertises and one of its two row overloads silently drops.
+    // It scores the rows itself instead.
+    let rows: [LogRow] = [
+        .line(buffered(line(message: "GET /healthz 200"))),
+        .line(buffered(line(message: "ERROR: boom"))),
+    ]
+
+    let kept = LogFilter(errorsOnly: true).apply(to: rows)
+    #expect(kept.flatMap { $0.lines.map(\.line.message) } == ["ERROR: boom"])
+}
+
+@Test func errorsOnlyRunsAfterRecordGroupingNotBeforeIt() {
+    // ORDER IS THE CLAIM. A pino record is a header line plus indented
+    // continuations; here the header is the failure and the continuations are
+    // ordinary text. The query matches only a CONTINUATION, so the record has
+    // to be formed for anything to survive at all — and the header is what
+    // opens the record.
+    //
+    // Gate first and it is the CONTINUATIONS that go, not the header: the
+    // header is the only failing row, so it is all the gate leaves — and the
+    // query matches none of it, so `LogRecord.group` has nothing to form a
+    // record around and the result is empty. Gate last and the record forms,
+    // the query keeps it whole, and the gate then leaves the failing header.
+    // Two orders, two different answers, on the same three rows.
+    //
+    // (In general the gate can also take a header — `LogFilter`'s own doc
+    // comment states that case, where the failure is a continuation and the
+    // header is ordinary. On THIS fixture it is the other way round, and the
+    // comment here used to describe the general case as if it were this one.)
+    let recordLines = [
+        line(message: "[01:13:52] ERROR: request failed", resource: "api", spanID: "dc:api"),
+        line(message: "    url: /api/invoke", resource: "api", spanID: "dc:api"),
+        line(message: "    responseTime: 12", resource: "api", spanID: "dc:api"),
+    ]
+    let rows = JSONBlock.detect(in: buffered(recordLines)).map(ScoredRow.init(scoring:))
+    #expect(rows.map(\.severity) == [.error, .normal, .normal])
+
+    let kept = LogFilter(query: "responseTime", errorsOnly: true).apply(to: rows)
+    #expect(kept.flatMap { $0.lines.map(\.line.message) } == ["[01:13:52] ERROR: request failed"])
 }

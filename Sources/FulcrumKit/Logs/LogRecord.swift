@@ -69,7 +69,19 @@ public enum LogRecord {
     /// one record and the concatenation of the result is `rows` again — a
     /// partition, never a filter (`LogRecordTests.groupingNeverLosesOrReordersRows`).
     public static func group(_ rows: [LogRow]) -> [[LogRow]] {
-        var records: [[LogRow]] = []
+        group(rows, firstLine: { $0.lines.first?.line })
+    }
+
+    /// `group(_:)` over any row type that can name its own first `LogLine`.
+    ///
+    /// Generic solely so `LogFilter` can group `ScoredRow`s — which are
+    /// `LogRow`s with a severity attached — without either a second copy of
+    /// this partition or an index-arithmetic dance to map a `[[LogRow]]`
+    /// result back onto the scored rows it came from. The grouping RULE reads
+    /// nothing but the row's first line, so there is nothing here for a row
+    /// type to change: `firstLine` is the entire surface a row presents to it.
+    static func group<Row>(_ rows: [Row], firstLine: (Row) -> LogLine?) -> [[Row]] {
+        var records: [[Row]] = []
         records.reserveCapacity(rows.count)
 
         // The header that opened the record being built, or nil when the
@@ -79,7 +91,7 @@ public enum LogRecord {
         // belongs to one resource and span throughout, so drift line-by-line
         // is not possible.
         var origin: LogLine?
-        var current: [LogRow] = []
+        var current: [Row] = []
 
         func closeCurrent() {
             if !current.isEmpty { records.append(current) }
@@ -91,7 +103,7 @@ public enum LogRecord {
             // A row always covers at least one line in practice; a
             // hypothetical empty one can neither open nor continue a record,
             // so it stands alone rather than being dropped.
-            guard let first = row.lines.first?.line else {
+            guard let first = firstLine(row) else {
                 closeCurrent()
                 records.append([row])
                 continue

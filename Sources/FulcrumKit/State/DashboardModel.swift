@@ -55,8 +55,38 @@ public final class DashboardModel {
     ) {
         self.appModel = appModel
         self.recents = recents
-        self.logPane = LogPaneModel(streaming: logStreaming)
+        self.logPane = LogPaneModel(
+            streaming: logStreaming,
+            capacity: appModel.settings.logScrollback.lineCount
+        )
         self.tiltfileExistence = tiltfileExistence
+    }
+
+    /// Points the log pane at whatever `SettingsStore.logScrollback` currently
+    /// says. Idempotent — `LogPaneModel.setCapacity(_:)` is a no-op at the
+    /// capacity already in force — so every caller can call it freely.
+    ///
+    /// Exists for the same reason `followSelectedInstanceLogs()` does, and
+    /// with the same limitation: `SettingsStore` is a SEPARATE `@Observable`
+    /// object, and an `@Observable` class has no hook that fires when
+    /// another object's property changes — only a view's `body`
+    /// re-evaluating does. So the picker in `SettingsView` cannot reach the
+    /// pane by itself; `LogPaneView` calls this from
+    /// `onChange(of: settings.logScrollback, initial: true)`.
+    ///
+    /// The `initial: true` is not redundant with `init` above passing the
+    /// stored capacity. `init` covers a pane built after the preference was
+    /// read; this covers the pane being alive while the preference changes,
+    /// including the case where Settings is open and the dashboard is not.
+    /// Both paths converge on the same value, which is why it is safe for
+    /// both to exist — the failure mode this project keeps hitting is a
+    /// second source of truth, and there isn't one here: `SettingsStore` is
+    /// it, and this method only ever pushes from it.
+    ///
+    /// Lives here rather than in the view so the wiring is testable without
+    /// SwiftUI — `FulcrumKit` cannot import it.
+    public func applyLogScrollbackSetting() {
+        logPane.setCapacity(appModel.settings.logScrollback.lineCount)
     }
 
     /// Re-derived on every read, which for a SwiftUI body means many times

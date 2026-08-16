@@ -71,6 +71,52 @@ enum Theme {
         }
     }
 
+    /// The background wash behind a log row `SeverityScanner` scored above
+    /// `.normal`, or `nil` for an ordinary row (no background at all, not a
+    /// clear one — see `LogRowView`).
+    ///
+    /// ## Which colours, and why no new ones
+    ///
+    /// The same `status.error` / `status.pending` assets `color(for:)` uses
+    /// for resource health and `color(for level:)` uses for a line's level.
+    /// A third meaning of "red" would need a new role with light AND dark
+    /// variants, and a colour set has been silently discarded from this
+    /// project's compiled `Assets.car` on a green build twice. Nothing about a
+    /// failing row wants a different red from the one the rest of the app
+    /// already means by it.
+    ///
+    /// ## Why opacity, and why these numbers
+    ///
+    /// BEHIND the message, never over it. Log messages already carry the
+    /// emitter's own ANSI colours — that is the whole of `color(forAnsi:)` —
+    /// and a solid fill would put a red panel behind red text. These are low
+    /// enough that `text.primary` and every `ansi.*` hue keep their contrast
+    /// against the pane's `surface`/`chrome` background in both appearances,
+    /// and high enough that a tinted row is findable at a glance while
+    /// scrolling. `focusHighlight` above sits at 0.18 for the same reason and
+    /// against the same backgrounds.
+    ///
+    /// Three levels rather than two: `.fatal` is the one a developer wants to
+    /// spot from across the room, and flattening it onto `.error` would throw
+    /// away the distinction `LogSeverity` exists to carry. `.warning` is
+    /// deliberately the faintest — it is where the weakest signal (`ansi.red`,
+    /// which fires on Flask's development-server banner) is capped, so it must
+    /// read as "worth a look", not as an alarm.
+    ///
+    /// THE NUMBERS ARE A JUDGEMENT, NOT A MEASUREMENT. Contrast against text
+    /// is checked by `ContrastTests` for the foreground roles; a translucent
+    /// background over two possible pane backgrounds is not something this
+    /// project's tests can judge, and layout/colour is the one thing here that
+    /// has consistently been caught by eye instead.
+    static func wash(for severity: LogSeverity) -> Color? {
+        switch severity {
+        case .normal: nil
+        case .warning: Color(.statusPending).opacity(0.12)
+        case .error: Color(.statusError).opacity(0.18)
+        case .fatal: Color(.statusError).opacity(0.30)
+        }
+    }
+
     /// Maps an ANSI SGR colour (`ANSI.parse(_:)`'s `Span.colour`) to a
     /// dashboard colour role, for the log pane's `AttributedString`
     /// rendering (see `LogPaneView`). `nil` — no SGR colour set — and
